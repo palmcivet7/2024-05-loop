@@ -7,6 +7,7 @@ import "@openzeppelin/contracts/utils/math/Math.sol";
 import {ILpETH, IERC20} from "./interfaces/ILpETH.sol";
 import {ILpETHVault} from "./interfaces/ILpETHVault.sol";
 import {IWETH} from "./interfaces/IWETH.sol";
+import {console} from "forge-std/Test.sol";
 
 /**
  * @title   PrelaunchPoints
@@ -26,6 +27,9 @@ contract PrelaunchPoints {
     ILpETHVault public lpETHVault;
     IWETH public immutable WETH;
     address public constant ETH = 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE;
+    // q what is exchangeProxy?
+    // a it is the address of the 0x ExchangeProxy
+    // https://etherscan.io/address/0xdef1c0ded9bec7f1a1670819833240f027b25eff#code
     address public immutable exchangeProxy;
 
     address public owner;
@@ -40,9 +44,12 @@ contract PrelaunchPoints {
     }
 
     bytes4 public constant UNI_SELECTOR = 0x803ba26d;
+    // transformERC20(address,address,uint256,uint256,(uint32,bytes)[])
     bytes4 public constant TRANSFORM_SELECTOR = 0x415565b0;
 
     uint32 public loopActivation;
+    // e startClaimDate gets set in convertAllETH by owner
+    // users cannot withdraw ETH or LRT after this, they can only claim lpETH
     uint32 public startClaimDate;
     uint32 public constant TIMELOCK = 7 days;
     bool public emergencyMode;
@@ -173,6 +180,21 @@ contract PrelaunchPoints {
         internal
         onlyBeforeDate(loopActivation)
     {
+        // @audit-followup reentrancy
+        /**
+         *     Reentrancy in PrelaunchPoints._processLock(address,uint256,address,bytes32) (src/PrelaunchPoints.sol#172-198):
+         *     External calls:
+         *     - IERC20(_token).safeTransferFrom(msg.sender,address(this),_amount) (src/PrelaunchPoints.sol#186)
+         *     - WETH.withdraw(_amount) (src/PrelaunchPoints.sol#189)
+         *     State variables written after the call(s):
+         *     - balances[_receiver][ETH] += _amount (src/PrelaunchPoints.sol#191)
+         *     - totalSupply = totalSupply + _amount (src/PrelaunchPoints.sol#190)
+         * Reentrancy in PrelaunchPoints._processLock(address,uint256,address,bytes32) (src/PrelaunchPoints.sol#172-198):
+         *     External calls:
+         *     - IERC20(_token).safeTransferFrom(msg.sender,address(this),_amount) (src/PrelaunchPoints.sol#186)
+         *     State variables written after the call(s):
+         *     - balances[_receiver][_token] += _amount (src/PrelaunchPoints.sol#193)
+         */
         if (_amount == 0) {
             revert CannotLockZero();
         }
@@ -186,10 +208,11 @@ contract PrelaunchPoints {
             IERC20(_token).safeTransferFrom(msg.sender, address(this), _amount);
 
             if (_token == address(WETH)) {
-                WETH.withdraw(_amount);
-                totalSupply = totalSupply + _amount;
-                balances[_receiver][ETH] += _amount;
+                WETH.withdraw(_amount); // coverage
+                totalSupply = totalSupply + _amount; // coverage
+                balances[_receiver][ETH] += _amount; // coverage
             } else {
+                // @audit-followup, so we're tracking the totalSupply for ETH but not other tokens?
                 balances[_receiver][_token] += _amount;
             }
         }
@@ -208,6 +231,8 @@ contract PrelaunchPoints {
      * @param _exchange   Exchange identifier where the swap takes place
      * @param _data       Swap data obtained from 0x API
      */
+    // q what is Exchange?
+    // a enum - UniswapV3 or TransformERC20
     function claim(address _token, uint8 _percentage, Exchange _exchange, bytes calldata _data)
         external
         onlyAfterDate(startClaimDate)
@@ -228,6 +253,9 @@ contract PrelaunchPoints {
         onlyAfterDate(startClaimDate)
     {
         uint256 claimedAmount = _claim(_token, address(this), _percentage, _exchange, _data);
+        // @audit-followup ignores return value
+        // https://solodit.xyz/issues/m-02-unchecked-low-level-calls-code4rena-boot-finance-boot-finance-contest-git
+        // https://github.com/crytic/slither/wiki/Detector-Documentation#unused-return
         lpETH.approve(address(lpETHVault), claimedAmount);
         lpETHVault.stake(claimedAmount, msg.sender);
 
@@ -241,25 +269,34 @@ contract PrelaunchPoints {
         internal
         returns (uint256 claimedAmount)
     {
+        // console.log("xxxxxxxxxx THIS LINE IS HIT xxxxxxxxxx");
         uint256 userStake = balances[msg.sender][_token];
         if (userStake == 0) {
             revert NothingToClaim();
         }
         if (_token == ETH) {
+            // coverage
             claimedAmount = userStake.mulDiv(totalLpETH, totalSupply);
             balances[msg.sender][_token] = 0;
             lpETH.safeTransfer(_receiver, claimedAmount);
         } else {
+            // console.log("-----------THIS LINE IS HIT-------------");
             uint256 userClaim = userStake * _percentage / 100;
-            _validateData(_token, userClaim, _exchange, _data);
-            balances[msg.sender][_token] = userStake - userClaim;
+            console.log("User Stake:", userStake);
+            console.log("Percentage:", _percentage);
+            console.log("Calculated Claim:", userClaim);
+            _validateData(_token, userClaim, _exchange, _data); // coverage
+            balances[msg.sender][_token] = userStake - userClaim; // coverage
 
             // At this point there should not be any ETH in the contract
             // Swap token to ETH
+            console.log("ETH Balance before swap:", address(this).balance);
             _fillQuote(IERC20(_token), userClaim, _data);
+            console.log("ETH Balance after swap:", address(this).balance);
+            console.log("Attempting to deposit ETH to lpETH:", claimedAmount);
 
             // Convert swapped ETH to lpETH (1 to 1 conversion)
-            claimedAmount = address(this).balance;
+            claimedAmount = address(this).balance; // coverage
             lpETH.deposit{value: claimedAmount}(_receiver);
         }
         emit Claimed(msg.sender, _token, claimedAmount);
@@ -285,11 +322,12 @@ contract PrelaunchPoints {
         balances[msg.sender][_token] = 0;
 
         if (lockedAmount == 0) {
+            // coverage
             revert CannotWithdrawZero();
         }
         if (_token == ETH) {
-            if (block.timestamp >= startClaimDate){
-                revert UseClaimInstead();
+            if (block.timestamp >= startClaimDate) {
+                revert UseClaimInstead(); // coverage
             }
             totalSupply = totalSupply - lockedAmount;
 
@@ -321,6 +359,8 @@ contract PrelaunchPoints {
         uint256 totalBalance = address(this).balance;
         lpETH.deposit{value: totalBalance}(address(this));
 
+        // q what happens if lpETH are sent to address(this) directly?
+        // a nothing, it just gets included and cant be retrieved by the sender
         totalLpETH = lpETH.balanceOf(address(this));
 
         // Claims of lpETH can start immediately after conversion.
@@ -405,17 +445,19 @@ contract PrelaunchPoints {
     function _validateData(address _token, uint256 _amount, Exchange _exchange, bytes calldata _data) internal view {
         address inputToken;
         address outputToken;
-        uint256 inputTokenAmount;
+        uint256 inputTokenAmount; // coverage
         address recipient;
         bytes4 selector;
 
         if (_exchange == Exchange.UniswapV3) {
-            (inputToken, outputToken, inputTokenAmount, recipient, selector) = _decodeUniswapV3Data(_data);
+            // coverage
+            (inputToken, outputToken, inputTokenAmount, recipient, selector) = _decodeUniswapV3Data(_data); // coverage
             if (selector != UNI_SELECTOR) {
                 revert WrongSelector(selector);
             }
             // UniswapV3Feature.sellTokenForEthToUniswapV3(encodedPath, sellAmount, minBuyAmount, recipient) requires `encodedPath` to be a Uniswap-encoded path, where the last token is WETH, and sends the NATIVE token to `recipient`
             if (outputToken != address(WETH)) {
+                // coverage
                 revert WrongDataTokens(inputToken, outputToken);
             }
         } else if (_exchange == Exchange.TransformERC20) {
@@ -424,6 +466,7 @@ contract PrelaunchPoints {
                 revert WrongSelector(selector);
             }
             if (outputToken != ETH) {
+                //coverage
                 revert WrongDataTokens(inputToken, outputToken);
             }
         } else {
@@ -431,13 +474,14 @@ contract PrelaunchPoints {
         }
 
         if (inputToken != _token) {
+            // coverage
             revert WrongDataTokens(inputToken, outputToken);
         }
         if (inputTokenAmount != _amount) {
             revert WrongDataAmount(inputTokenAmount);
         }
         if (recipient != address(this) && recipient != address(0)) {
-            revert WrongRecipient(recipient);
+            revert WrongRecipient(recipient); // coverage
         }
     }
 
@@ -454,10 +498,10 @@ contract PrelaunchPoints {
         assembly {
             let p := _data.offset
             selector := calldataload(p)
-            p := add(p, 36) // Data: selector 4 + lenght data 32
+            p := add(p, 36) // Data: selector 4 + lenght data 32 // coverage
             inputTokenAmount := calldataload(p)
             recipient := calldataload(add(p, 64))
-            encodedPathLength := calldataload(add(p, 96)) // Get length of encodedPath (obtained through abi.encodePacked)
+            encodedPathLength := calldataload(add(p, 96)) // Get length of encodedPath (obtained through abi.encodePacked) // coverage
             inputToken := shr(96, calldataload(add(p, 128))) // Shift to the Right with 24 zeroes (12 bytes = 96 bits) to get address
             outputToken := shr(96, calldataload(add(p, add(encodedPathLength, 108)))) // Get last address of the hop
         }
@@ -467,17 +511,15 @@ contract PrelaunchPoints {
      * @notice Decodes the data sent from 0x API when other exchanges are used via 0x TransformERC20 function
      * @param _data      swap data from 0x API
      */
-    function _decodeTransformERC20Data(bytes calldata _data)
-        internal
-        pure
-        returns (address inputToken, address outputToken, uint256 inputTokenAmount, bytes4 selector)
-    {
+    function _decodeTransformERC20Data(
+        bytes calldata _data // coverage
+    ) internal pure returns (address inputToken, address outputToken, uint256 inputTokenAmount, bytes4 selector) {
         assembly {
             let p := _data.offset
-            selector := calldataload(p)
+            selector := calldataload(p) // coverage
             inputToken := calldataload(add(p, 4)) // Read slot, selector 4 bytes
             outputToken := calldataload(add(p, 36)) // Read slot
-            inputTokenAmount := calldataload(add(p, 68)) // Read slot
+            inputTokenAmount := calldataload(add(p, 68)) // Read slot // coverage
         }
     }
 
@@ -487,20 +529,24 @@ contract PrelaunchPoints {
      * @param _amount       The `sellAmount` field from the API response.
      * @param _swapCallData  The `data` field from the API response.
      */
-
     function _fillQuote(IERC20 _sellToken, uint256 _amount, bytes calldata _swapCallData) internal {
+        // coverage
         // Track our balance of the buyToken to determine how much we've bought.
-        uint256 boughtETHAmount = address(this).balance;
+        uint256 boughtETHAmount = address(this).balance; // coverage
 
+        console.log("Approved amount for swap:", _sellToken.allowance(address(this), exchangeProxy));
         require(_sellToken.approve(exchangeProxy, _amount));
 
-        (bool success,) = payable(exchangeProxy).call{value: 0}(_swapCallData);
+        // q what is happening here?
+        // a _swapCallData is sent to 0x protocol's Zero Exchange contract which then makes a swap with
+        //   either Uniswap or TransformERC20
+        (bool success,) = payable(exchangeProxy).call{value: 0}(_swapCallData); // coverage
         if (!success) {
-            revert SwapCallFailed();
+            revert SwapCallFailed(); // coverage
         }
 
         // Use our current buyToken balance to determine how much we've bought.
-        boughtETHAmount = address(this).balance - boughtETHAmount;
+        boughtETHAmount = address(this).balance - boughtETHAmount; // coverage
         emit SwappedTokens(address(_sellToken), _amount, boughtETHAmount);
     }
 
@@ -523,6 +569,7 @@ contract PrelaunchPoints {
     }
 
     modifier onlyBeforeDate(uint256 limitDate) {
+        //coverage
         if (block.timestamp >= limitDate) {
             revert NoLongerPossible();
         }
