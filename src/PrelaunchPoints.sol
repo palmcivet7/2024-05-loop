@@ -282,18 +282,18 @@ contract PrelaunchPoints {
         } else {
             // console.log("-----------THIS LINE IS HIT-------------");
             uint256 userClaim = userStake * _percentage / 100;
-            console.log("User Stake:", userStake);
-            console.log("Percentage:", _percentage);
-            console.log("Calculated Claim:", userClaim);
+            // console.log("User Stake:", userStake);
+            // console.log("Percentage:", _percentage);
+            // console.log("Calculated Claim:", userClaim);
             _validateData(_token, userClaim, _exchange, _data); // coverage
             balances[msg.sender][_token] = userStake - userClaim; // coverage
 
             // At this point there should not be any ETH in the contract
             // Swap token to ETH
-            console.log("ETH Balance before swap:", address(this).balance);
+            // console.log("ETH Balance before swap:", address(this).balance);
             _fillQuote(IERC20(_token), userClaim, _data);
-            console.log("ETH Balance after swap:", address(this).balance);
-            console.log("Attempting to deposit ETH to lpETH:", claimedAmount);
+            // console.log("ETH Balance after swap:", address(this).balance);
+            // console.log("Attempting to deposit ETH to lpETH:", claimedAmount);
 
             // Convert swapped ETH to lpETH (1 to 1 conversion)
             claimedAmount = address(this).balance; // coverage

